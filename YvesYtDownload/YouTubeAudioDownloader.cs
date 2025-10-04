@@ -4,25 +4,32 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using YoutubeExplode;
+using Microsoft.Extensions.Logging;
+using YoutubeExplode.Exceptions;
 using YoutubeExplode.Videos.Streams;
-using YoutubeExplode.Converter;
+using YvesYtDownload.Services;
 
 namespace YvesYtDownload;
 
 public partial class YoutubeDownloader : Form
 {
-    private double _totalSize = 0;
-    private string _ffmpegpath = Environment.CurrentDirectory + "\\ffmpeg.exe";
+    private readonly string _ffmpegpath = Environment.CurrentDirectory + "\\ffmpeg.exe";
+    private readonly IYoutubeService _youtubeService;
+    private readonly ILogger<YoutubeDownloader> _logger;
+    private readonly ILogger<YoutubeExplodeService> _serviceLogger;
 
     public YoutubeDownloader()
     {
         this.InitializeComponent();
         this.urlTextBox.TextChanged += this.UrlTextBox_TextChanged;
         this.outputDirectoryTextBox.Text = Environment.CurrentDirectory.ToString();
+        
+        _logger = new SimpleLogger<YoutubeDownloader>();
+        _serviceLogger = new SimpleLogger<YoutubeExplodeService>();
+        _youtubeService = new YoutubeExplodeService(_serviceLogger, _ffmpegpath);
     }
 
-    private void UrlTextBox_TextChanged(object sender, EventArgs e)
+    private void UrlTextBox_TextChanged(object? sender, EventArgs e)
     {
         string url = this.urlTextBox.Text;
         if (string.IsNullOrWhiteSpace(url) || !this.IsValidYouTubeUrl(url))
@@ -37,35 +44,41 @@ public partial class YoutubeDownloader : Form
 
     private async void downloadButton_Click(object sender, EventArgs e)
     {
+        string url = this.urlTextBox.Text;
+
+        if (string.IsNullOrWhiteSpace(url) || !this.IsValidYouTubeUrl(url))
+        {
+            MessageBox.Show("Please enter a valid YouTube URL.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
         try
         {
-            string url = this.urlTextBox.Text;
-
-            if (string.IsNullOrWhiteSpace(url) || !this.IsValidYouTubeUrl(url))
-            {
-                MessageBox.Show("Please enter a valid YouTube URL.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-
-            try
-            {
-                this.downloadButton.Enabled = false;
-                await this.DownloadYouTubeVideoAsync(url);
-                MessageBox.Show("Download complete!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"An error occurred: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            finally
-            {
-                this.downloadButton.Enabled = true;
-                this.statusLabel.Text = "Ready";
-            }
+            this.downloadButton.Enabled = false;
+            _logger.LogInformation("Starting download for URL: {Url}", url);
+            await this.DownloadYouTubeVideoAsync(url);
+            _logger.LogInformation("Download completed successfully for URL: {Url}", url);
+            MessageBox.Show("Download complete!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (VideoUnavailableException ex)
+        {
+            _logger.LogError(ex, "Video is unavailable: {Url}", url);
+            MessageBox.Show("This video is unavailable or has been removed.", "Video Unavailable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        catch (RequestLimitExceededException ex)
+        {
+            _logger.LogError(ex, "Request limit exceeded for: {Url}", url);
+            MessageBox.Show("YouTube rate limit exceeded. Please try again later.", "Rate Limit", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         catch (Exception ex)
         {
-            throw ex; // TODO handle exception
+            _logger.LogError(ex, "An error occurred during download: {Url}. Error type: {ExceptionType}", url, ex.GetType().Name);
+            MessageBox.Show($"An error occurred: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            this.downloadButton.Enabled = true;
+            this.statusLabel.Text = "Ready";
         }
     }
 
@@ -110,7 +123,8 @@ public partial class YoutubeDownloader : Form
     {
         try
         {
-            string ffmpegPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg.exe"); // Adjust if FFmpeg is not in PATH
+            string ffmpegPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg.exe");
+            _logger.LogInformation("Converting to MP3: {InputPath} -> {OutputPath}", inputFilePath, outputFilePath);
 
             var process = new Process
             {
@@ -130,12 +144,17 @@ public partial class YoutubeDownloader : Form
 
             if (process.ExitCode != 0)
             {
-                throw new Exception("FFmpeg conversion failed: " + await process.StandardError.ReadToEndAsync());
+                string errorOutput = await process.StandardError.ReadToEndAsync();
+                _logger.LogError("FFmpeg conversion failed with exit code {ExitCode}: {Error}", process.ExitCode, errorOutput);
+                throw new Exception("FFmpeg conversion failed: " + errorOutput);
             }
+            
+            _logger.LogInformation("Successfully converted to MP3: {OutputPath}", outputFilePath);
         }
         catch (Exception ex)
         {
-            throw; // TODO handle exception
+            _logger.LogError(ex, "Error during MP3 conversion: {InputPath}", inputFilePath);
+            throw;
         }
     }
 
@@ -148,65 +167,70 @@ public partial class YoutubeDownloader : Form
     {
         try
         {
-            this.UpdateStatus("Getting manifest info...", 20);
+            this.UpdateStatus("Getting video info...", 10);
 
-            var youtube = new YoutubeClient();
-            //Gets the video based on the URL provided by Yves
-            var video = await youtube.Videos.GetAsync(url);
-            //Gets the stream manifest, which contains information about all available video and audio streams for the selected video
-            var streamManifest = await youtube.Videos.Streams.GetManifestAsync(video.Id);
+            var video = await _youtubeService.GetVideoAsync(url);
+            
+            this.UpdateStatus("Getting stream manifest...", 20);
+            var streamManifest = await _youtubeService.GetStreamManifestAsync(video.Id);
 
-            //Gets a video stream
-            var videoStreamInfo = streamManifest.GetVideoStreams()
-                                                //Get video streams in the mp4 format
-                                                .Where(s => s.Container == YoutubeExplode.Videos.Streams.Container.Mp4)
-                                                //Where quality is HD (1080p or higher)
-                                                .FirstOrDefault(vq => vq.VideoQuality.IsHighDefinition);
+            var videoStreamInfo = StreamSelector.SelectVideoStream(streamManifest, _logger);
+            var audioStreamInfo = StreamSelector.SelectAudioStream(streamManifest, _logger);
 
-            //Get audio stream
-            var audioStreamInfo = streamManifest.GetAudioStreams()
-                                                //Get mp4-compatible audio streams
-                                                .Where(s => s.Container == YoutubeExplode.Videos.Streams.Container.Mp4)
-                                                //Get the highest quality audio stream that YouTube has available
-                                                .GetWithHighestBitrate();
+            if (audioStreamInfo == null)
+            {
+                throw new InvalidOperationException("No suitable audio stream found for this video.");
+            }
 
-            //Sanitise the title and remove characters that are invalid for Windows filenames
             string sanitizedTitle = YoutubeDownloader.SanitizeFileName(video.Title);
-            //Output directory set by the user
-            string outputDirectory = string.IsNullOrWhiteSpace(this.outputDirectoryTextBox.Text) ? Environment.CurrentDirectory : this.outputDirectoryTextBox.Text;
+            string outputDirectory = string.IsNullOrWhiteSpace(this.outputDirectoryTextBox.Text) 
+                ? Environment.CurrentDirectory 
+                : this.outputDirectoryTextBox.Text;
 
             string outputFilePath = Path.Combine(outputDirectory, $"{sanitizedTitle}.mp4");
 
             if (videoStreamInfo != null)
             {
-                //Set total size for progress tracking on the interface 
-                double totalVideoSize = videoStreamInfo.Size.Bytes / 1_000_000.0; // Convert to MB
-                double totalAudioSize = audioStreamInfo.Size.Bytes / 1_000_000.0; // Convert to MB
+                double totalVideoSize = videoStreamInfo.Size.Bytes / 1_000_000.0;
+                double totalAudioSize = audioStreamInfo.Size.Bytes / 1_000_000.0;
                 double totalSize = totalAudioSize + totalVideoSize;
 
                 var streamInfos = new IStreamInfo[] { audioStreamInfo, videoStreamInfo };
-
-
-                var crb = new ConversionRequestBuilder(outputFilePath);
-                //Set the output format, medium speed for higher quality 
-                crb.SetContainer(YoutubeExplode.Videos.Streams.Container.Mp4).SetFFmpegPath(this._ffmpegpath)
-                   .SetPreset(ConversionPreset.Medium);
-                crb.Build();
-                //Initial progress bar value before download
                 int progBarCurrent = this.progressBar1.Value;
 
-                //Here we can pass in a progress variable to Youtube's API which will be a value between 0 and 1 that represents the percentage completion of the download process
-                await youtube.Videos.DownloadAsync(
-                    streamInfos, crb.Build(), new Progress<double>(
-                        progress =>
-                        {
-                            double progressPercentage = progress * 79;
-                            int progressValue = progBarCurrent + (int)progressPercentage;
-                            this.UpdateProgress(progressValue);
-                            this.UpdateStatus(
-                                $"Downloading video and audio streams and converting... {progressValue}%, {progress * totalSize:F2} MB of {totalSize:F2} MB downloaded",
-                                progressValue);
-                        }));
+                await _youtubeService.DownloadAsync(
+                    streamInfos, 
+                    outputFilePath, 
+                    new Progress<double>(progress =>
+                    {
+                        double progressPercentage = progress * 79;
+                        int progressValue = progBarCurrent + (int)progressPercentage;
+                        this.UpdateProgress(progressValue);
+                        this.UpdateStatus(
+                            $"Downloading video and audio streams and converting... {progressValue}%, {progress * totalSize:F2} MB of {totalSize:F2} MB downloaded",
+                            progressValue);
+                    }));
+            }
+            else
+            {
+                _logger.LogInformation("No video stream available, downloading audio only");
+                
+                double totalAudioSize = audioStreamInfo.Size.Bytes / 1_000_000.0;
+                var streamInfos = new IStreamInfo[] { audioStreamInfo };
+                int progBarCurrent = this.progressBar1.Value;
+
+                await _youtubeService.DownloadAsync(
+                    streamInfos, 
+                    outputFilePath, 
+                    new Progress<double>(progress =>
+                    {
+                        double progressPercentage = progress * 79;
+                        int progressValue = progBarCurrent + (int)progressPercentage;
+                        this.UpdateProgress(progressValue);
+                        this.UpdateStatus(
+                            $"Downloading audio stream and converting... {progressValue}%, {progress * totalAudioSize:F2} MB of {totalAudioSize:F2} MB downloaded",
+                            progressValue);
+                    }));
             }
 
             this.UpdateStatus("Download complete!", 100);
